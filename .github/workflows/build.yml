@@ -33,18 +33,26 @@ jobs:
           choco install innosetup -y --no-progress
           Write-Host "Inno Setup installed"
 
-      # Static link of sherpa-onnx + onnxruntime requires compiling C++ sources
-      # on first cold build (~15-25 min on GH Windows runner). Cache will usually
-      # rescue us after the first successful run.
-      - name: Build stt_sapi5 release DLL (static)
+      # Dynamic link + delay-load: we ship sherpa-onnx DLLs next to our DLL
+      # and resolve them from DllMain via SetDllDirectoryW. Rust build stays
+      # fast (~10-15 min cold) because no C++ sources are compiled here.
+      - name: Build stt_sapi5 release DLL (dynamic + delay-load)
         shell: pwsh
-        timeout-minutes: 90
-        env:
-          CMAKE_BUILD_PARALLEL_LEVEL: "4"
+        timeout-minutes: 30
         run: |
           cargo build --release `
             --package stt_sapi5_xiao_ya `
             --target x86_64-pc-windows-msvc
+
+      - name: Download sherpa-onnx Windows shared runtime
+        shell: pwsh
+        run: |
+          $url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.9/sherpa-onnx-v1.12.9-win-x64-shared.tar.bz2"
+          Invoke-WebRequest -Uri $url -OutFile sherpa-onnx-runtime.tar.bz2
+          tar -xjf sherpa-onnx-runtime.tar.bz2
+          $libdir = "sherpa-onnx-v1.12.9-win-x64-shared\lib"
+          Write-Host "--- sherpa runtime DLLs ---"
+          Get-ChildItem $libdir\*.dll | Select-Object Name,Length
 
       - name: Download xiao_ya sherpa-onnx model (fp16)
         shell: pwsh
@@ -70,6 +78,13 @@ jobs:
           Copy-Item target\x86_64-pc-windows-msvc\release\stt_xiao_ya_sapi5.dll $payload\
           Copy-Item -Recurse xiao_ya $payload\xiao_ya
           Copy-Item VC_redist.x64.exe $payload\
+          # sherpa-onnx runtime DLLs (delay-loaded, resolved via SetDllDirectoryW)
+          $libdir = "sherpa-onnx-v1.12.9-win-x64-shared\lib"
+          Copy-Item $libdir\sherpa-onnx-c-api.dll $payload\
+          Copy-Item $libdir\sherpa-onnx-cxx-api.dll $payload\
+          Copy-Item $libdir\onnxruntime.dll $payload\
+          Copy-Item $libdir\onnxruntime_providers_shared.dll $payload\
+          Copy-Item $libdir\cargs.dll $payload\
           Write-Host "--- payload contents ---"
           Get-ChildItem -Recurse $payload | Select-Object FullName,Length
 

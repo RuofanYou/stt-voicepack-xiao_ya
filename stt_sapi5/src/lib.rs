@@ -323,3 +323,40 @@ impl SafeTtsComServer for TtsComServer {
 
 // Export SAPI5 COM entry points from the DLL.
 dll_export_com_server_fns!(TtsComServer);
+
+// ---------------------------------------------------------------------------
+// DllMain: set DLL search path to our own directory so that delay-loaded
+// sherpa-onnx-c-api.dll / onnxruntime.dll can be resolved next to us.
+// We deliberately avoid modifying PATH or writing to System32.
+// ---------------------------------------------------------------------------
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{BOOL, HMODULE, MAX_PATH as DLLMAIN_MAX_PATH, TRUE};
+use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, SetDllDirectoryW};
+use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
+
+#[no_mangle]
+#[allow(non_snake_case)]
+pub unsafe extern "system" fn DllMain(
+    hinst_dll: *mut core::ffi::c_void,
+    fdw_reason: u32,
+    _lpv_reserved: *mut core::ffi::c_void,
+) -> BOOL {
+    if fdw_reason == DLL_PROCESS_ATTACH {
+        let hmodule = HMODULE(hinst_dll);
+        let mut buf = [0u16; DLLMAIN_MAX_PATH as usize];
+        let n = GetModuleFileNameW(Some(hmodule), &mut buf);
+        if n > 0 && (n as usize) < buf.len() {
+            // Trim the trailing file name, leaving just the directory.
+            let mut len = n as usize;
+            while len > 0 && buf[len - 1] != b'\\' as u16 {
+                len -= 1;
+            }
+            if len > 0 {
+                // Null-terminate in place (drop the trailing backslash).
+                buf[len - 1] = 0;
+                let _ = SetDllDirectoryW(PCWSTR(buf.as_ptr()));
+            }
+        }
+    }
+    TRUE
+}

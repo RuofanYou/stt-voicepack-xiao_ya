@@ -43,8 +43,17 @@ ShowLanguageDialog=no
 Name: "chs"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-; Our SAPI5 DLL (statically linked sherpa-onnx + onnxruntime)
+; Our SAPI5 DLL (dynamically linked to sherpa-onnx; delay-loaded)
 Source: "payload\stt_xiao_ya_sapi5.dll"; DestDir: "{app}"; Flags: ignoreversion
+
+; sherpa-onnx runtime DLLs — placed next to our DLL. DllMain calls
+; SetDllDirectoryW({app}) so delay-load stubs can find them without PATH
+; pollution or System32 writes.
+Source: "payload\sherpa-onnx-c-api.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "payload\sherpa-onnx-cxx-api.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "payload\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "payload\onnxruntime_providers_shared.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "payload\cargs.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 ; xiao_ya model bundle (copied recursively)
 Source: "payload\xiao_ya\*"; DestDir: "{app}\xiao_ya"; Flags: ignoreversion recursesubdirs createallsubdirs
