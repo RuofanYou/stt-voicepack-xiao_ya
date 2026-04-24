@@ -1,0 +1,59 @@
+name: build-windows-dll
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+
+      - name: Build stt_sapi5 release DLL
+        shell: pwsh
+        run: cargo build --release --package stt_sapi5_xiao_ya --target x86_64-pc-windows-msvc
+
+      - name: Download xiao_ya sherpa-onnx model (fp16 ~28MB)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-zh_CN-xiao_ya-medium-fp16.tar.bz2"
+          Invoke-WebRequest -Uri $url -OutFile xiao_ya.tar.bz2
+          tar -xjf xiao_ya.tar.bz2
+          Rename-Item vits-piper-zh_CN-xiao_ya-medium-fp16 xiao_ya
+
+      - name: Stage distribution folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\STT-xiao_ya-VoicePack | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\stt_xiao_ya_sapi5.dll dist\STT-xiao_ya-VoicePack\
+          Copy-Item -Recurse xiao_ya dist\STT-xiao_ya-VoicePack\xiao_ya
+          Copy-Item installer\install.bat dist\STT-xiao_ya-VoicePack\
+          Copy-Item installer\uninstall.bat dist\STT-xiao_ya-VoicePack\
+          Copy-Item installer\README.txt dist\STT-xiao_ya-VoicePack\
+          Get-ChildItem -Recurse dist\STT-xiao_ya-VoicePack | Select-Object FullName,Length
+
+      - name: Zip distribution
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\STT-xiao_ya-VoicePack -DestinationPath dist\STT-xiao_ya-VoicePack.zip -Force
+          Get-Item dist\STT-xiao_ya-VoicePack.zip | Select-Object FullName,Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: STT-xiao_ya-VoicePack
+          path: dist/STT-xiao_ya-VoicePack.zip
+          retention-days: 30

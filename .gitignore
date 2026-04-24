@@ -1,0 +1,13 @@
+target/
+Cargo.lock.bak
+*.orig
+*.rej
+.DS_Store
+
+# Local research/work dirs — not checked in
+lej77_ref/
+rust_smoke_test/
+xiao_ya_pkg/
+xiao_ya-fp16.tar.bz2
+xiao_ya-medium.tar.bz2
+voice_pack/

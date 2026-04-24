@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "stt_sapi5",
+    "stt_sapi5/windows_tts_engine",
+]
+exclude = ["rust_smoke_test", "lej77_ref"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["STT Voice Pack Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RuofanYou/stt-voicepack-xiao_ya"
+
+[workspace.dependencies]
+windows-core = "0.59.0"
+windows = "0.59.0"
+winresource = "0.1.19"
+log = "0.4.25"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
