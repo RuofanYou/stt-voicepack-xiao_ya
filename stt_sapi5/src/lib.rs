@@ -6,6 +6,7 @@
 use std::{
     ffi::OsString,
     os::windows::ffi::OsStringExt,
+    panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{Mutex, OnceLock},
     time::Instant,
@@ -30,10 +31,15 @@ use windows_tts_engine::{
         dll_export_com_server_fns, ComClassInfo, ComServerPath, ComThreadingModel, SafeTtsComServer,
     },
     logging::DllLogger,
-    utils::get_current_dll_path,
+    utils::{get_current_dll_path, safe_catch_unwind},
     voices::{ParentRegKey, VoiceAttributes, VoiceKeyData},
     SafeTtsEngine, SpeechFormat, TextFrag, TextFragIter,
 };
+
+/// Standard E_FAIL HRESULT (0x80004005).
+fn e_fail() -> windows::core::Error {
+    windows::core::Error::from_hresult(windows::core::HRESULT(-2147467259_i32))
+}
 
 // xiao_ya native sample rate (from .onnx.json: 22050 Hz).
 const SAMPLE_RATE: u32 = 22050;
@@ -113,10 +119,19 @@ impl OurTtsEngine {
     }
 
     fn with_tts<R>(&self, f: impl FnOnce(&mut VitsTts) -> R) -> Option<R> {
-        let slot = self.tts.get_or_init(|| {
-            let tts = Self::build_tts().expect("Failed to build xiao_ya VitsTts");
-            Mutex::new(tts)
-        });
+        // Try to initialise lazily; if init fails, return None instead of panicking.
+        if self.tts.get().is_none() {
+            match safe_catch_unwind(AssertUnwindSafe(Self::build_tts)).flatten() {
+                Some(tts) => {
+                    let _ = self.tts.set(Mutex::new(tts));
+                }
+                None => {
+                    log::error!("build_tts failed or panicked; refusing to speak");
+                    return None;
+                }
+            }
+        }
+        let slot = self.tts.get()?;
         let mut guard = slot.lock().ok()?;
         Some(f(&mut guard))
     }
@@ -137,58 +152,70 @@ impl SafeTtsEngine for OurTtsEngine {
         text_fragments: Option<TextFrag<'_>>,
         output_site: &ISpTTSEngineSite,
     ) -> windows::core::Result<()> {
-        let text_utf16 = TextFragIter::new(text_fragments)
-            .flat_map(|frag| frag.utf16_text().iter().copied().chain([' ' as u16]))
-            .collect::<Vec<u16>>();
-        let text = String::from_utf16_lossy(&text_utf16);
-        let text = text.trim();
-        log::debug!("Speak: {}", text);
+        // Catch any residual panic so that WoW never aborts because of TTS.
+        let result: Option<windows::core::Result<()>> =
+            safe_catch_unwind(AssertUnwindSafe(|| -> windows::core::Result<()> {
+                let text_utf16 = TextFragIter::new(text_fragments)
+                    .flat_map(|frag| frag.utf16_text().iter().copied().chain([' ' as u16]))
+                    .collect::<Vec<u16>>();
+                let text = String::from_utf16_lossy(&text_utf16);
+                let text = text.trim();
+                log::debug!("Speak: {}", text);
 
-        if text.is_empty() {
-            return Ok(());
-        }
+                if text.is_empty() {
+                    return Ok(());
+                }
 
-        let started = Instant::now();
-        let audio = self
-            .with_tts(|tts| tts.create(text, 0, 1.0))
-            .expect("tts init")
-            .map_err(|e| {
-                log::error!("sherpa-rs synthesize failed: {e}");
-                windows::core::Error::from_hresult(windows::core::HRESULT(-2147467259_i32))
-            })?;
-        log::debug!(
-            "Synthesized {} samples ({} Hz) in {:?}",
-            audio.samples.len(),
-            audio.sample_rate,
-            started.elapsed()
-        );
+                let started = Instant::now();
+                let synth = self.with_tts(|tts| tts.create(text, 0, 1.0)).ok_or_else(|| {
+                    log::error!("TTS engine not initialised; returning E_FAIL");
+                    e_fail()
+                })?;
+                let audio = synth.map_err(|e| {
+                    log::error!("sherpa-rs synthesize failed: {e}");
+                    e_fail()
+                })?;
+                log::debug!(
+                    "Synthesized {} samples ({} Hz) in {:?}",
+                    audio.samples.len(),
+                    audio.sample_rate,
+                    started.elapsed()
+                );
 
-        // Convert f32 samples (-1.0..=1.0) to 16-bit signed little-endian PCM bytes.
-        let mut pcm_bytes = Vec::with_capacity(audio.samples.len() * 2);
-        for &s in &audio.samples {
-            let clamped = s.clamp(-1.0, 1.0);
-            let sample_i16 = (clamped * 32767.0).round() as i16;
-            pcm_bytes.extend_from_slice(&sample_i16.to_le_bytes());
-        }
+                // f32 samples (-1.0..=1.0) -> 16-bit signed little-endian PCM.
+                let mut pcm_bytes = Vec::with_capacity(audio.samples.len() * 2);
+                for &s in &audio.samples {
+                    let clamped = s.clamp(-1.0, 1.0);
+                    let sample_i16 = (clamped * 32767.0).round() as i16;
+                    pcm_bytes.extend_from_slice(&sample_i16.to_le_bytes());
+                }
 
-        // Stream to output_site in 4 KB chunks, honouring abort requests.
-        let mut buffer = pcm_bytes.as_slice();
-        while !buffer.is_empty() {
-            let written_bytes = unsafe {
-                output_site.Write(buffer.as_ptr().cast(), buffer.len().min(4096) as u32)
-            }?;
-            buffer = &buffer[written_bytes as usize..];
+                // Stream to output_site in 4 KB chunks, honouring abort requests.
+                let mut buffer = pcm_bytes.as_slice();
+                while !buffer.is_empty() {
+                    let written_bytes = unsafe {
+                        output_site.Write(buffer.as_ptr().cast(), buffer.len().min(4096) as u32)
+                    }?;
+                    buffer = &buffer[written_bytes as usize..];
 
-            let actions = unsafe { output_site.GetActions() } as i32;
-            if actions == SPVES_CONTINUE.0 {
-                continue;
+                    let actions = unsafe { output_site.GetActions() } as i32;
+                    if actions == SPVES_CONTINUE.0 {
+                        continue;
+                    }
+                    if SPVES_ABORT.0 & actions != 0 {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }));
+
+        match result {
+            Some(inner) => inner,
+            None => {
+                log::error!("speak() panicked; returning E_FAIL instead of unwinding into WoW");
+                Err(e_fail())
             }
-            if SPVES_ABORT.0 & actions != 0 {
-                return Ok(());
-            }
         }
-
-        Ok(())
     }
 
     #[allow(non_snake_case)]
@@ -197,20 +224,30 @@ impl SafeTtsEngine for OurTtsEngine {
         _token: &ISpObjectToken,
         target_format: Option<SpeechFormat>,
     ) -> windows::core::Result<SpeechFormat> {
-        log::debug!("get_output_format: {target_format:?}");
-        if let Some(SpeechFormat::DebugText) = target_format {
-            return Ok(SpeechFormat::DebugText);
+        let result: Option<windows::core::Result<SpeechFormat>> =
+            safe_catch_unwind(AssertUnwindSafe(|| -> windows::core::Result<SpeechFormat> {
+                log::debug!("get_output_format: {target_format:?}");
+                if let Some(SpeechFormat::DebugText) = target_format {
+                    return Ok(SpeechFormat::DebugText);
+                }
+                let nBlockAlign: u16 = 2;
+                Ok(SpeechFormat::Wave(WAVEFORMATEX {
+                    wFormatTag: WAVE_FORMAT_PCM as _,
+                    nChannels: 1,
+                    nBlockAlign,
+                    wBitsPerSample: 16,
+                    nSamplesPerSec: SAMPLE_RATE,
+                    nAvgBytesPerSec: SAMPLE_RATE * (nBlockAlign as u32),
+                    cbSize: 0,
+                }))
+            }));
+        match result {
+            Some(inner) => inner,
+            None => {
+                log::error!("get_output_format() panicked; returning E_FAIL");
+                Err(e_fail())
+            }
         }
-        let nBlockAlign: u16 = 2;
-        Ok(SpeechFormat::Wave(WAVEFORMATEX {
-            wFormatTag: WAVE_FORMAT_PCM as _,
-            nChannels: 1,
-            nBlockAlign,
-            wBitsPerSample: 16,
-            nSamplesPerSec: SAMPLE_RATE,
-            nAvgBytesPerSec: SAMPLE_RATE * (nBlockAlign as u32),
-            cbSize: 0,
-        }))
     }
 }
 

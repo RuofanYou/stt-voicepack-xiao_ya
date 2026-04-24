@@ -11,3 +11,6 @@ xiao_ya_pkg/
 xiao_ya-fp16.tar.bz2
 xiao_ya-medium.tar.bz2
 voice_pack/
+final_dist/
+installer/payload/
+installer/output/

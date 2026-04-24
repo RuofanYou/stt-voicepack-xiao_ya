@@ -21,7 +21,7 @@ disable_logging_in_release = [
 [dependencies]
 windows_tts_engine = { path = "./windows_tts_engine" }
 log = { workspace = true }
-sherpa-rs = { version = "0.6", features = ["tts"] }
+sherpa-rs = { version = "0.6", default-features = false, features = ["tts", "static"] }
 
 [dependencies.windows]
 workspace = true
