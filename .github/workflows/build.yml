@@ -21,11 +21,18 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cargo cache
+      # 只缓存 ~/.cargo 的 registry/索引，不缓存 target/。
+      # 因为 sherpa-rs-sys 的 build.rs 会把 prebuilt sherpa-onnx 解压到
+      # %LOCALAPPDATA%\sherpa-rs\... （不在 rust-cache 范围内）。如果缓存了
+      # target/，cargo 会跳过 sherpa-rs-sys 的 build script 重新执行，但
+      # LIBPATH 仍指向那个外部目录，本地却没有该目录 → cargs.lib 链接失败。
+      # 关掉 target/ 缓存让 build.rs 每次都跑一次，下载到正确位置。
+      - name: Cargo cache (registry only)
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             .
+          cache-targets: false
 
       - name: Install Inno Setup (choco)
         shell: pwsh
@@ -36,18 +43,6 @@ jobs:
       # Dynamic link + delay-load: we ship sherpa-onnx DLLs next to our DLL
       # and load them from DllMain via absolute LoadLibraryW. Rust build stays
       # fast (~10-15 min cold) because no C++ sources are compiled here.
-      #
-      # NOTE: sherpa-rs-sys 的 build.rs 会把 prebuilt sherpa-onnx 解压到
-      # %LOCALAPPDATA%\sherpa-rs\... 这个目录在 actions/rust-cache 的缓存
-      # 范围之外。如果上一次 run 把 sherpa-rs-sys 的编译产物缓存进了 target/，
-      # 本次 cargo 会跳过其 build.rs 重新执行，导致 LIBPATH 指向不存在的
-      # 目录，链接 cargs.lib 失败。这里先 clean 掉 sherpa-rs-sys 强制重跑。
-      - name: Force sherpa-rs-sys rebuild (refresh prebuilt cache outside rust-cache)
-        shell: pwsh
-        run: |
-          cargo clean -p sherpa-rs-sys --target x86_64-pc-windows-msvc
-          cargo clean -p sherpa-rs-sys
-
       - name: Build stt_sapi5 release DLL (dynamic + delay-load)
         shell: pwsh
         timeout-minutes: 30
