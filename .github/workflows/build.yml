@@ -34,8 +34,20 @@ jobs:
           Write-Host "Inno Setup installed"
 
       # Dynamic link + delay-load: we ship sherpa-onnx DLLs next to our DLL
-      # and resolve them from DllMain via SetDllDirectoryW. Rust build stays
+      # and load them from DllMain via absolute LoadLibraryW. Rust build stays
       # fast (~10-15 min cold) because no C++ sources are compiled here.
+      #
+      # NOTE: sherpa-rs-sys 的 build.rs 会把 prebuilt sherpa-onnx 解压到
+      # %LOCALAPPDATA%\sherpa-rs\... 这个目录在 actions/rust-cache 的缓存
+      # 范围之外。如果上一次 run 把 sherpa-rs-sys 的编译产物缓存进了 target/，
+      # 本次 cargo 会跳过其 build.rs 重新执行，导致 LIBPATH 指向不存在的
+      # 目录，链接 cargs.lib 失败。这里先 clean 掉 sherpa-rs-sys 强制重跑。
+      - name: Force sherpa-rs-sys rebuild (refresh prebuilt cache outside rust-cache)
+        shell: pwsh
+        run: |
+          cargo clean -p sherpa-rs-sys --target x86_64-pc-windows-msvc
+          cargo clean -p sherpa-rs-sys
+
       - name: Build stt_sapi5 release DLL (dynamic + delay-load)
         shell: pwsh
         timeout-minutes: 30
