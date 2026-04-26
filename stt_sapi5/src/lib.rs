@@ -325,13 +325,14 @@ impl SafeTtsComServer for TtsComServer {
 dll_export_com_server_fns!(TtsComServer);
 
 // ---------------------------------------------------------------------------
-// DllMain: set DLL search path to our own directory so that delay-loaded
-// sherpa-onnx-c-api.dll / onnxruntime.dll can be resolved next to us.
-// We deliberately avoid modifying PATH or writing to System32.
+// DllMain: 用绝对路径预加载我们目录下的依赖 DLL（onnxruntime / sherpa-onnx
+// c-api），把它们放进进程模块表。这样后续 delay-load 触发的 LoadLibrary
+// 会直接复用已加载模块，无需修改进程级搜索路径，避免污染宿主进程
+// （如 WoW、讲述人）的 DLL 解析逻辑。
 // ---------------------------------------------------------------------------
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HMODULE, MAX_PATH as DLLMAIN_MAX_PATH, TRUE};
-use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, SetDllDirectoryW};
+use windows::Win32::Foundation::{BOOL, HMODULE, TRUE};
+use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, LoadLibraryW};
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
 #[no_mangle]
@@ -343,18 +344,25 @@ pub unsafe extern "system" fn DllMain(
 ) -> BOOL {
     if fdw_reason == DLL_PROCESS_ATTACH {
         let hmodule = HMODULE(hinst_dll);
-        let mut buf = [0u16; DLLMAIN_MAX_PATH as usize];
+        let mut buf = [0u16; 1024];
         let n = GetModuleFileNameW(Some(hmodule), &mut buf);
         if n > 0 && (n as usize) < buf.len() {
-            // Trim the trailing file name, leaving just the directory.
-            let mut len = n as usize;
-            while len > 0 && buf[len - 1] != b'\\' as u16 {
-                len -= 1;
+            // 找最后一个反斜杠；dir_len 是反斜杠后位置（即文件名起点）。
+            let mut dir_len = n as usize;
+            while dir_len > 0 && buf[dir_len - 1] != b'\\' as u16 {
+                dir_len -= 1;
             }
-            if len > 0 {
-                // Null-terminate in place (drop the trailing backslash).
-                buf[len - 1] = 0;
-                let _ = SetDllDirectoryW(PCWSTR(buf.as_ptr()));
+            // 用绝对路径预加载依赖 DLL，避免依赖进程级搜索路径。
+            // 顺序：先加载 onnxruntime（基础），再加载 sherpa-onnx-c-api（依赖前者）。
+            for dll_name in ["onnxruntime.dll", "sherpa-onnx-c-api.dll"] {
+                let mut full: Vec<u16> = buf[..dir_len].to_vec();
+                for c in dll_name.encode_utf16() {
+                    full.push(c);
+                }
+                full.push(0); // null terminator
+                // 失败也吞掉：若依赖缺失，后续真正调用时 delay-load 才报错，
+                // 至少不会在 DllMain 中崩 WoW。
+                let _ = LoadLibraryW(PCWSTR(full.as_ptr()));
             }
         }
     }

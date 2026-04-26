@@ -21,7 +21,7 @@ AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 VersionInfoVersion={#MyAppVersion}
 
-DefaultDirName={autopf}\STT-xiao_ya-VoicePack
+DefaultDirName=C:\STT-xiao_ya-VoicePack
 DefaultGroupName=STT xiao_ya VoicePack
 DisableProgramGroupPage=yes
 UninstallDisplayName={#MyAppName}
