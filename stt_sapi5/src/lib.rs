@@ -75,25 +75,74 @@ impl OurTtsEngine {
         Some(dir)
     }
 
+    /// 从我们 DLL 同目录用绝对路径主动 LoadLibraryW 预加载 sherpa-onnx 依赖。
+    /// 必须放在第一次 speak 时（不在 DllMain loader-lock 下），避免
+    /// onnxruntime 的 DllMain 在 loader lock 状态下死锁/崩。
+    fn preload_runtime_dlls(dll_dir: &std::path::Path) {
+        use std::os::windows::ffi::OsStrExt;
+        unsafe {
+            for dll_name in ["onnxruntime.dll", "sherpa-onnx-c-api.dll"] {
+                let path = dll_dir.join(dll_name);
+                let exists = path.is_file();
+                log::info!("preload: trying {} (exists={})", path.display(), exists);
+                if !exists {
+                    continue;
+                }
+                let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+                wide.push(0);
+                let h = LoadLibraryW(PCWSTR(wide.as_ptr()));
+                match h {
+                    Ok(_) => log::info!("preload: {} loaded", dll_name),
+                    Err(e) => log::error!("preload: {} FAILED: {e}", dll_name),
+                }
+            }
+        }
+    }
+
     fn build_tts() -> Option<VitsTts> {
-        let dir = Self::model_dir()?;
-        let j = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        log::info!("build_tts: enter");
+        let model_dir = Self::model_dir()?;
+        log::info!("build_tts: model_dir = {}", model_dir.display());
+
+        // 主动预加载依赖 DLL（绝对路径，从我们 DLL 同目录加载）。
+        // model_dir 是 <dll_dir>/xiao_ya，所以父目录就是 dll_dir。
+        if let Some(dll_dir) = model_dir.parent() {
+            Self::preload_runtime_dlls(dll_dir);
+        }
+
+        let j = |name: &str| model_dir.join(name).to_string_lossy().into_owned();
+
+        // 检查每个关键文件是否存在并 log
+        for n in [
+            "zh_CN-xiao_ya-medium.onnx",
+            "tokens.txt",
+            "lexicon.txt",
+            "phone.fst",
+            "date.fst",
+            "number.fst",
+        ] {
+            let p = model_dir.join(n);
+            log::info!("build_tts: file {} exists={} size={:?}",
+                n, p.is_file(),
+                std::fs::metadata(&p).map(|m| m.len()).ok());
+        }
 
         // Optional FSTs (may not all exist for every xiao_ya variant).
         let mut fsts = Vec::new();
         for n in ["phone.fst", "date.fst", "number.fst", "new_heteronym.fst"] {
-            let p = dir.join(n);
+            let p = model_dir.join(n);
             if p.is_file() {
                 fsts.push(p.to_string_lossy().into_owned());
             }
         }
         let rule_fsts = fsts.join(",");
+        log::info!("build_tts: rule_fsts = {}", rule_fsts);
 
         let config = VitsTtsConfig {
             model: j("zh_CN-xiao_ya-medium.onnx"),
             tokens: j("tokens.txt"),
             lexicon: j("lexicon.txt"),
-            dict_dir: if dir.join("dict").is_dir() { j("dict") } else { String::new() },
+            dict_dir: if model_dir.join("dict").is_dir() { j("dict") } else { String::new() },
             data_dir: String::new(),
             length_scale: 1.0,
             noise_scale: 0.667,
@@ -112,9 +161,10 @@ impl OurTtsEngine {
             },
         };
 
+        log::info!("build_tts: config built, calling VitsTts::new ...");
         let started = Instant::now();
         let tts = VitsTts::new(config);
-        log::info!("VitsTts initialized in {:?}", started.elapsed());
+        log::info!("build_tts: VitsTts::new returned in {:?}", started.elapsed());
         Some(tts)
     }
 
@@ -325,46 +375,21 @@ impl SafeTtsComServer for TtsComServer {
 dll_export_com_server_fns!(TtsComServer);
 
 // ---------------------------------------------------------------------------
-// DllMain: 用绝对路径预加载我们目录下的依赖 DLL（onnxruntime / sherpa-onnx
-// c-api），把它们放进进程模块表。这样后续 delay-load 触发的 LoadLibrary
-// 会直接复用已加载模块，无需修改进程级搜索路径，避免污染宿主进程
-// （如 WoW、讲述人）的 DLL 解析逻辑。
+// DllMain: 故意只返回 TRUE。**不要** 在这里 LoadLibrary 任何东西——
+// onnxruntime 自己 DllMain 在 loader-lock 下做的初始化曾导致 WoW 崩
+// (0xc0000409 / FAST_FAIL_FATAL_APP_EXIT)。
+// 真正的依赖预加载推迟到第一次 build_tts() 时（不在 loader lock 下）。
 // ---------------------------------------------------------------------------
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HMODULE, TRUE};
-use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, LoadLibraryW};
-use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
+use windows::Win32::Foundation::{BOOL, TRUE};
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
 #[no_mangle]
 #[allow(non_snake_case)]
 pub unsafe extern "system" fn DllMain(
-    hinst_dll: *mut core::ffi::c_void,
-    fdw_reason: u32,
+    _hinst_dll: *mut core::ffi::c_void,
+    _fdw_reason: u32,
     _lpv_reserved: *mut core::ffi::c_void,
 ) -> BOOL {
-    if fdw_reason == DLL_PROCESS_ATTACH {
-        let hmodule = HMODULE(hinst_dll);
-        let mut buf = [0u16; 1024];
-        let n = GetModuleFileNameW(Some(hmodule), &mut buf);
-        if n > 0 && (n as usize) < buf.len() {
-            // 找最后一个反斜杠；dir_len 是反斜杠后位置（即文件名起点）。
-            let mut dir_len = n as usize;
-            while dir_len > 0 && buf[dir_len - 1] != b'\\' as u16 {
-                dir_len -= 1;
-            }
-            // 用绝对路径预加载依赖 DLL，避免依赖进程级搜索路径。
-            // 顺序：先加载 onnxruntime（基础），再加载 sherpa-onnx-c-api（依赖前者）。
-            for dll_name in ["onnxruntime.dll", "sherpa-onnx-c-api.dll"] {
-                let mut full: Vec<u16> = buf[..dir_len].to_vec();
-                for c in dll_name.encode_utf16() {
-                    full.push(c);
-                }
-                full.push(0); // null terminator
-                // 失败也吞掉：若依赖缺失，后续真正调用时 delay-load 才报错，
-                // 至少不会在 DllMain 中崩 WoW。
-                let _ = LoadLibraryW(PCWSTR(full.as_ptr()));
-            }
-        }
-    }
     TRUE
 }
